@@ -55,19 +55,27 @@ LTC_FRAME_BITS = 80
 
 
 def find_zero_crossings(samples, threshold=0.02):
-    """Detect zero-crossing indices with Schmitt-trigger hysteresis."""
-    state = 0
-    if samples[0] > threshold:
-        state = 1
-    elif samples[0] < -threshold:
-        state = -1
+    """Detect zero-crossing indices with Schmitt-trigger hysteresis.
 
+    Handles signals that start at zero (silence) by latching onto the
+    first excursion beyond the threshold in either direction.
+    """
+    state = 0
     crossings = []
-    for i in range(1, len(samples)):
-        if state == 1 and samples[i] < -threshold:
+
+    for i in range(len(samples)):
+        s = samples[i]
+        if state == 0:
+            if s > threshold:
+                state = 1
+                crossings.append(i)
+            elif s < -threshold:
+                state = -1
+                crossings.append(i)
+        elif state == 1 and s < -threshold:
             state = -1
             crossings.append(i)
-        elif state == -1 and samples[i] > threshold:
+        elif state == -1 and s > threshold:
             state = 1
             crossings.append(i)
     return crossings
@@ -114,10 +122,13 @@ def bits_to_bytes(bits):
 def find_sync_offset(data):
     """Search for the LTC sync word in a byte buffer.
 
-    Returns the byte offset where the sync word starts, or -1.
+    With LSB-first byte packing the sync word appears byte-swapped
+    compared to libltc's MSB-first packing: [0xFC, 0xBF] instead of [0xBF, 0xFC].
+
+    Returns the byte offset where the sync pair *starts* (lower byte), or -1.
     """
     for i in range(len(data) - 1):
-        if ((data[i] << 8) | data[i + 1]) == LTC_SYNC_WORD:
+        if ((data[i + 1] << 8) | data[i]) == LTC_SYNC_WORD:
             return i
     return -1
 
@@ -159,57 +170,120 @@ def parse_timecode(frame_bytes):
     return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
 
 
-def decode_ltc_numpy(samples, sample_rate, fps):
-    """Decode LTC from raw audio samples using numpy."""
-    bit_rate = fps * LTC_FRAME_BITS
-    bit_period = sample_rate / bit_rate
+CANDIDATE_FPS = [25, 30, 24, 29.97]
+LTC_SYNC_WORD = 0xBFFC
+LTC_FRAME_BITS = 80
+LTC_FRAME_BYTES = 10
 
-    crossings = find_zero_crossings(samples, threshold=0.02)
-    if len(crossings) < 20:
-        return None
 
-    intervals = intervals_from_crossings(crossings)
-    if len(intervals) == 0:
-        return None
+def _timecode_to_frame_number(tc_str, fps):
+    """Convert HH:MM:SS:FF to absolute frame number."""
+    hh, mm, ss, ff = (int(x) for x in tc_str.split(":"))
+    return ((hh * 3600) + (mm * 60) + ss) * fps + ff
+
+
+def _decode_frame_from_bits(bits, start_byte, fps):
+    """Decode a single LTC frame from a byte buffer at the given offset.
+
+    Returns (timecode_str, frame_number) or (None, None).
+    """
+    if start_byte + LTC_FRAME_BYTES > len(bits):
+        return None, None
+    f = bits[start_byte : start_byte + LTC_FRAME_BYTES]
+    tc = parse_timecode(f)
+    if tc is None:
+        return None, None
+    fn = _timecode_to_frame_number(tc, fps)
+    return tc, fn
+
+
+def _score_fps(intervals, sample_rate, fps):
+    """Score how well a given FPS explains the biphase intervals.
+
+    Returns (first_timecode, consecutive_frame_count).
+    """
+    bit_period = sample_rate / (fps * LTC_FRAME_BITS)
+    threshold = bit_period * 0.75
 
     bits = decode_biphase(intervals, bit_period)
     data = bits_to_bytes(bits)
-    if len(data) < 10:
-        return None
+    if len(data) < LTC_FRAME_BYTES:
+        return None, 0
 
     sync_idx = find_sync_offset(data)
     if sync_idx < 0:
-        return None
+        return None, 0
 
-    # The sync word sits at bytes 8-9 of the frame.
-    # If found at data[sync_idx], then the frame starts at sync_idx - 8.
-    frame_start = sync_idx - 8
+    frame_start = sync_idx - (LTC_FRAME_BYTES - 2)
     if frame_start < 0:
-        return None
+        return None, 0
 
-    frame = data[frame_start : frame_start + 10]
-    return parse_timecode(frame)
+    first_tc, _ = _decode_frame_from_bits(data, frame_start, fps)
+    if first_tc is None:
+        return None, 0
+
+    # Count consecutive frames at 10-byte spacings
+    consecutive = 1
+    for offset in range(
+        frame_start + LTC_FRAME_BYTES,
+        len(data) - LTC_FRAME_BYTES + 1,
+        LTC_FRAME_BYTES,
+    ):
+        tc, _ = _decode_frame_from_bits(data, offset, fps)
+        if tc is None:
+            break
+        consecutive += 1
+
+    return first_tc, consecutive
+
+
+def decode_ltc_numpy(samples, sample_rate, fps=None):
+    """Decode LTC from raw audio samples using numpy.
+
+    If fps is None, auto-detects by scoring all candidate frame rates
+    and picking the one that produces the most consecutive valid frames.
+    Returns (timecode_str, used_fps) or (None, None).
+    """
+    crossings = find_zero_crossings(samples, threshold=0.02)
+    if len(crossings) < 20:
+        return None, None
+
+    intervals = intervals_from_crossings(crossings)
+    if len(intervals) == 0:
+        return None, None
+
+    fps_list = [fps] if fps is not None else list(CANDIDATE_FPS)
+    if fps is not None:
+        for f in CANDIDATE_FPS:
+            if f not in fps_list:
+                fps_list.append(f)
+
+    best_tc, best_fps, best_score = None, None, 0
+    for try_fps in fps_list:
+        tc, score = _score_fps(intervals, sample_rate, try_fps)
+        if tc and score > best_score:
+            best_tc, best_fps, best_score = tc, try_fps, score
+
+    return best_tc, best_fps
 
 
 def decode_ltc_from_wav(wav_path, fps=None, max_seconds=10):
     """Read a WAV file and decode LTC from it.
 
-    Returns (timecode_str, actual_fps) or (None, actual_fps).
+    If fps is None, the LTC decoder will auto-detect the frame rate.
+    Returns (timecode_str, actual_fps) or (None, None).
     """
-    if fps is None:
-        fps = 25  # default
-
     with open(wav_path, "rb") as f:
         # Parse minimal WAV header
         riff = f.read(4)
         if riff != b"RIFF":
             log.error("Not a valid RIFF/WAV file")
-            return None, fps
+            return None, None
         f.read(4)  # file size
         wave = f.read(4)
         if wave != b"WAVE":
             log.error("Not a valid WAVE file")
-            return None, fps
+            return None, None
 
         # Find fmt chunk
         sample_rate = 48000
@@ -240,7 +314,7 @@ def decode_ltc_from_wav(wav_path, fps=None, max_seconds=10):
                 f.read(chunk_size)
             except struct.error:
                 log.error("Could not find data chunk in WAV")
-                return None, fps
+                return None, None
 
         bytes_per_sample = bits_per_sample // 8
         max_frames = int(sample_rate * max_seconds)
@@ -256,7 +330,7 @@ def decode_ltc_from_wav(wav_path, fps=None, max_seconds=10):
         dtype = np.int32
     else:
         log.error(f"Unsupported bit depth: {bits_per_sample}")
-        return None, fps
+        return None, None
 
     audio = np.frombuffer(raw, dtype=dtype).astype(np.float64)
 
@@ -274,7 +348,7 @@ def decode_ltc_from_wav(wav_path, fps=None, max_seconds=10):
         f"WAV: {len(audio)} samples, {sample_rate} Hz, {num_channels} ch, {bits_per_sample} bit"
     )
 
-    return decode_ltc_numpy(audio, sample_rate, fps), fps
+    return decode_ltc_numpy(audio, sample_rate, fps)
 
 
 # ---------------------------------------------------------------------------
@@ -287,19 +361,22 @@ def libltc_available():
 
 
 def decode_with_ltcdecode(wav_path, fps=None):
-    """Use libltc's ltcdecode CLI to decode LTC from a WAV file."""
+    """Use libltc's ltcdecode CLI to decode LTC from a WAV file.
+
+    Returns (timecode_str, fps) or (None, None).
+    """
     cmd = ["ltcdecode", str(wav_path)]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except FileNotFoundError:
-        return None, fps
+        return None, None
     except subprocess.TimeoutExpired:
         log.warning("ltcdecode timed out")
-        return None, fps
+        return None, None
 
     if result.returncode != 0:
         log.debug(f"ltcdecode error: {result.stderr.strip()}")
-        return None, fps
+        return None, None
 
     # Parse timecode from first output line
     for line in result.stdout.strip().split("\n"):
@@ -307,7 +384,7 @@ def decode_with_ltcdecode(wav_path, fps=None):
         if m:
             return f"{m.group(1)}:{m.group(2)}:{m.group(3)}:{m.group(4)}", fps
 
-    return None, fps
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -467,9 +544,10 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
 
         # Try libltc first, fall back to pure Python
         tc = None
+        detected_fps = fps
         if libltc_available():
             log.debug("  Using ltcdecode (libltc)")
-            tc, _ = decode_with_ltcdecode(wav_path, fps)
+            tc, detected_fps = decode_with_ltcdecode(wav_path, fps)
 
         if tc is None:
             if not HAS_NUMPY:
@@ -479,13 +557,14 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
                 )
                 return False
             log.debug("  Using pure Python LTC decoder")
-            tc, _ = decode_ltc_from_wav(wav_path, fps)
+            tc, detected_fps = decode_ltc_from_wav(wav_path, fps)
 
         if tc is None:
             log.info(f"SKIP (no LTC signal found): {video_path.name}")
             return False
 
-        log.info(f"  Timecode: {tc}")
+        fps_str = f" @{detected_fps}fps" if detected_fps and detected_fps != fps else ""
+        log.info(f"  Timecode: {tc}{fps_str}")
 
         # Determine output path
         if overwrite:
