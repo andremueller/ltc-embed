@@ -474,7 +474,10 @@ def extract_audio_to_wav(video_path, wav_path, max_seconds=10):
 
 
 def write_timecode_to_video(video_path, timecode_str, output_path):
-    """Embed timecode metadata into video without re-encoding."""
+    """Embed timecode metadata into video without re-encoding.
+
+    Uses -map 0 to preserve all streams (including GoPro gpmd metadata).
+    """
     cmd = [
         "ffmpeg",
         "-y",
@@ -482,6 +485,8 @@ def write_timecode_to_video(video_path, timecode_str, output_path):
         "error",
         "-i",
         str(video_path),
+        "-map",
+        "0",
         "-c",
         "copy",
         "-timecode",
@@ -493,6 +498,8 @@ def write_timecode_to_video(video_path, timecode_str, output_path):
         raise RuntimeError(
             f"ffmpeg metadata write failed: {result.stderr.strip()}"
         )
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError("ffmpeg produced empty or missing output file")
     return output_path
 
 
@@ -575,7 +582,7 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
                 log.info(f"  Updated (in-place): {video_path.name}")
             finally:
                 if temp_output.exists():
-                    temp_output.unlink(missing_ok=True)
+                    temp_output.unlink()
         else:
             stem = video_path.stem
             output_path = video_path.parent / f"{stem}{suffix}{ext}"
