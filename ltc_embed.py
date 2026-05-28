@@ -589,7 +589,7 @@ def write_timecode_to_video(video_path, timecode_str, output_path):
 OUTPUT_SUFFIX = "_tc"
 
 
-def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10):
+def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0):
     """Process a single video file: extract LTC audio, decode timecode, embed.
 
     Returns True on success, False if skipped, raises on error.
@@ -650,6 +650,10 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
             log.info(f"SKIP (no LTC signal found): {video_path.name}")
             return False
 
+        if frame_offset != 0:
+            effective_fps = detected_fps if detected_fps else video_fps
+            tc = _subtract_frames(tc, effective_fps, -frame_offset)
+
         fps_str = f" @{detected_fps}fps" if detected_fps and detected_fps != video_fps else ""
         log.info(f"  Timecode: {tc}{fps_str}")
 
@@ -677,7 +681,7 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
 
 
 def process_directory(
-    directory, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10
+    directory, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0,
 ):
     """Scan directory for video files and process each."""
     directory = Path(directory)
@@ -700,7 +704,7 @@ def process_directory(
 
     for video in videos:
         try:
-            result = process_file(video, fps, suffix, overwrite, max_duration)
+            result = process_file(video, fps, suffix, overwrite, max_duration, frame_offset)
             if result:
                 success += 1
             else:
@@ -750,6 +754,13 @@ def main():
         help="Seconds of audio to analyze for LTC (default: 10)",
     )
     parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Manual frame offset (e.g. -3 to shift timecode 3 frames earlier)",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug output"
     )
     args = parser.parse_args()
@@ -772,10 +783,10 @@ def main():
     for path in args.input:
         p = Path(path)
         if p.is_dir():
-            process_directory(p, args.fps, args.suffix, args.overwrite, args.duration)
+            process_directory(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset)
         elif p.is_file():
             try:
-                process_file(p, args.fps, args.suffix, args.overwrite, args.duration)
+                process_file(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset)
             except Exception as exc:
                 log.error(f"FAILED: {p.name} — {exc}")
         else:
