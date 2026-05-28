@@ -192,6 +192,11 @@ def _subtract_frames(tc_str, fps, frames):
     return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
 
 
+def _add_frames(tc_str, fps, frames):
+    """Add frames to a timecode, wrapping at 24 h."""
+    return _subtract_frames(tc_str, fps, -frames)
+
+
 def _decode_biphase_with_index(intervals, bit_period):
     """Decode biphase-mark bits and track which intervals produced each bit.
 
@@ -487,16 +492,31 @@ def get_video_info(video_path):
 
     has_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
 
-    return {"fps": fps, "has_audio": has_audio}
+    duration = None
+    fmt = info.get("format", {})
+    if "duration" in fmt:
+        try:
+            duration = float(fmt["duration"])
+        except (ValueError, TypeError):
+            pass
+
+    return {"fps": fps, "has_audio": has_audio, "duration": duration}
 
 
-def extract_audio_to_wav(video_path, wav_path, max_seconds=10):
-    """Extract first audio track as mono 48kHz 16-bit WAV."""
+def extract_audio_to_wav(video_path, wav_path, max_seconds=10, seek_end=False):
+    """Extract first audio track as mono 48kHz 16-bit WAV.
+
+    If seek_end is True, reads the last *max_seconds* of the file.
+    """
     cmd = [
         "ffmpeg",
         "-y",
         "-v",
         "error",
+    ]
+    if seek_end:
+        cmd += ["-sseof", f"-{max_seconds}"]
+    cmd += [
         "-i",
         str(video_path),
         "-map",
@@ -507,12 +527,10 @@ def extract_audio_to_wav(video_path, wav_path, max_seconds=10):
         "48000",
         "-sample_fmt",
         "s16",
-        "-t",
-        str(max_seconds),
-        "-f",
-        "wav",
-        str(wav_path),
     ]
+    if not seek_end:
+        cmd += ["-t", str(max_seconds)]
+    cmd += ["-f", "wav", str(wav_path)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg audio extraction failed: {result.stderr.strip()}")
@@ -653,6 +671,33 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
         if frame_offset != 0:
             effective_fps = detected_fps if detected_fps else video_fps
             tc = _subtract_frames(tc, effective_fps, -frame_offset)
+
+        # ── tail-drift check ──
+        duration_s = info.get("duration")
+        effective_fps = detected_fps if detected_fps else video_fps
+        if duration_s and duration_s > max_duration * 3 and effective_fps:
+            tail_wav = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
+            try:
+                extract_audio_to_wav(video_path, tail_wav, max_duration, seek_end=True)
+                tail_tc, tail_fps = decode_ltc_from_wav(tail_wav, fps)
+                if tail_tc and tail_fps:
+                    tail_pos_frames = round((duration_s - max_duration) * effective_fps)
+                    expected_tail_tc = _add_frames(tc, effective_fps, tail_pos_frames)
+                    drift_frames = _timecode_to_frame_number(tail_tc, effective_fps) - _timecode_to_frame_number(expected_tail_tc, effective_fps)
+                    if drift_frames != 0:
+                        sign = "+" if drift_frames > 0 else ""
+                        log.warning(
+                            f"  Drift: head={tc} tail={tail_tc} expected={expected_tail_tc} "
+                            f"→ {sign}{drift_frames}fr over {duration_s:.0f}s "
+                            f"({'⚠ ' if abs(drift_frames) > 1 else ''}adjust with --offset {sign}{-drift_frames})"
+                        )
+                    else:
+                        log.info(f"  Drift: head/tail consistent (0fr over {duration_s:.0f}s)")
+            except Exception as exc:
+                log.debug(f"  Tail check skipped: {exc}")
+            finally:
+                if tail_wav.exists():
+                    tail_wav.unlink()
 
         fps_str = f" @{detected_fps}fps" if detected_fps and detected_fps != video_fps else ""
         log.info(f"  Timecode: {tc}{fps_str}")
