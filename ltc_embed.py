@@ -237,28 +237,33 @@ def _score_fps(intervals, sample_rate, fps):
     return first_tc, consecutive
 
 
+CANDIDATE_THRESHOLDS = [0.01, 0.02, 0.03, 0.04, 0.06, 0.08]
+
+
 def decode_ltc_numpy(samples, sample_rate, fps=None):
     """Decode LTC from raw audio samples using numpy.
 
-    If fps is None, auto-detects by scoring all candidate frame rates
-    and picking the one that produces the most consecutive valid frames.
+    Tries several zero-crossing hysteresis thresholds and FPS values,
+    picking the combination that yields the most consecutive valid frames.
+    If fps is None, auto-detects frame rate; if given, only that rate is used.
     Returns (timecode_str, used_fps) or (None, None).
     """
-    crossings = find_zero_crossings(samples, threshold=0.02)
-    if len(crossings) < 20:
-        return None, None
-
-    intervals = intervals_from_crossings(crossings)
-    if len(intervals) == 0:
-        return None, None
-
     fps_list = [fps] if fps is not None else list(CANDIDATE_FPS)
-
     best_tc, best_fps, best_score = None, None, 0
-    for try_fps in fps_list:
-        tc, score = _score_fps(intervals, sample_rate, try_fps)
-        if tc and score > best_score:
-            best_tc, best_fps, best_score = tc, try_fps, score
+
+    for threshold in CANDIDATE_THRESHOLDS:
+        crossings = find_zero_crossings(samples, threshold=threshold)
+        if len(crossings) < 20:
+            continue
+
+        intervals = intervals_from_crossings(crossings)
+        if len(intervals) == 0:
+            continue
+
+        for try_fps in fps_list:
+            tc, score = _score_fps(intervals, sample_rate, try_fps)
+            if tc and score > best_score:
+                best_tc, best_fps, best_score = tc, try_fps, score
 
     return best_tc, best_fps
 
