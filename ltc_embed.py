@@ -253,10 +253,6 @@ def decode_ltc_numpy(samples, sample_rate, fps=None):
         return None, None
 
     fps_list = [fps] if fps is not None else list(CANDIDATE_FPS)
-    if fps is not None:
-        for f in CANDIDATE_FPS:
-            if f not in fps_list:
-                fps_list.append(f)
 
     best_tc, best_fps, best_score = None, None, 0
     for try_fps in fps_list:
