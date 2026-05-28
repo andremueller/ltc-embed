@@ -473,9 +473,38 @@ def extract_audio_to_wav(video_path, wav_path, max_seconds=10):
     return wav_path
 
 
+def find_tmcd_streams(video_path):
+    """Return a list of stream indices that carry existing QuickTime tmcd tracks.
+
+    These must be excluded when re-writing timecode to avoid duplicate
+    timecode tracks in the output.
+    """
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", str(video_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    tmcd = []
+    for s in info.get("streams", []):
+        if s.get("codec_type") == "data" and s.get("codec_tag_string") == "tmcd":
+            tmcd.append(s["index"])
+    return tmcd
+
+
 def write_timecode_to_video(video_path, timecode_str, output_path):
     """Embed timecode metadata into video without re-encoding.
 
+    Existing tmcd tracks are stripped first so the new timecode is the
+    only one — avoids duplicate timecode entries that confuse NLEs.
     Uses -map 0 to preserve all streams (including GoPro gpmd metadata).
     """
     cmd = [
@@ -487,6 +516,10 @@ def write_timecode_to_video(video_path, timecode_str, output_path):
         str(video_path),
         "-map",
         "0",
+    ]
+    for idx in find_tmcd_streams(video_path):
+        cmd += ["-map", f"-0:{idx}"]
+    cmd += [
         "-c",
         "copy",
         "-timecode",
