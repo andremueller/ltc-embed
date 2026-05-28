@@ -86,27 +86,6 @@ def intervals_from_crossings(crossings):
     return [(crossings[i + 1] - crossings[i]) for i in range(len(crossings) - 1)]
 
 
-def decode_biphase(intervals, bit_period_samples):
-    """Decode biphase-mark encoded bits from interval lengths.
-
-    A '0' bit produces one long period (≈ bit_period).
-    A '1' bit produces two short periods (≈ bit_period/2 each).
-    """
-    threshold = bit_period_samples * 0.75
-
-    shorts = [True if p < threshold else False for p in intervals]
-    bits = []
-    i = 0
-    while i < len(shorts):
-        if shorts[i] and i + 1 < len(shorts) and shorts[i + 1]:
-            bits.append(1)
-            i += 2
-        else:
-            bits.append(0)
-            i += 1
-    return bits
-
-
 def bits_to_bytes(bits):
     """Pack bit stream into bytes (LSB-first: bit 0 → byte bit 0)."""
     data = []
@@ -197,30 +176,71 @@ def _decode_frame_from_bits(bits, start_byte, fps):
     return tc, fn
 
 
+def _subtract_frames(tc_str, fps, frames):
+    """Subtract a number of frames from a timecode, wrapping at 24 h.
+
+    Example: '00:00:14:35' - 110 frames @25fps = '00:00:10:25'
+    """
+    hh, mm, ss, ff = (int(x) for x in tc_str.split(":"))
+    total = ((hh * 3600) + (mm * 60) + ss) * fps + ff
+    total -= frames
+    total %= 24 * 3600 * fps
+    hh = (total // (3600 * fps))
+    mm = (total // (60 * fps)) % 60
+    ss = (total // fps) % 60
+    ff = total % fps
+    return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
+
+
+def _decode_biphase_with_index(intervals, bit_period):
+    """Decode biphase-mark bits and track which intervals produced each bit.
+
+    Returns (bits, bit_interval_start):
+      bits                – list of 0/1
+      bit_interval_start  – for each bit, the index in *intervals* where
+                            the first contributing interval begins
+    """
+    threshold = bit_period * 0.75
+    bits = []
+    bit_interval_start = []
+    i = 0
+    while i < len(intervals):
+        p = intervals[i]
+        if p < threshold and i + 1 < len(intervals) and intervals[i + 1] < threshold:
+            bits.append(1)
+            bit_interval_start.append(i)
+            i += 2
+        else:
+            bits.append(0)
+            bit_interval_start.append(i)
+            i += 1
+    return bits, bit_interval_start
+
+
 def _score_fps(intervals, sample_rate, fps):
     """Score how well a given FPS explains the biphase intervals.
 
-    Returns (first_timecode, consecutive_frame_count).
+    Returns (first_timecode, consecutive_frame_count, sample_offset).
+    sample_offset is the distance in samples from audio start to the
+    first contributing interval of the first valid LTC frame.
     """
     bit_period = sample_rate / (fps * LTC_FRAME_BITS)
-    threshold = bit_period * 0.75
-
-    bits = decode_biphase(intervals, bit_period)
+    bits, bit_interval_start = _decode_biphase_with_index(intervals, bit_period)
     data = bits_to_bytes(bits)
     if len(data) < LTC_FRAME_BYTES:
-        return None, 0
+        return None, 0, 0
 
     sync_idx = find_sync_offset(data)
     if sync_idx < 0:
-        return None, 0
+        return None, 0, 0
 
     frame_start = sync_idx - (LTC_FRAME_BYTES - 2)
     if frame_start < 0:
-        return None, 0
+        return None, 0, 0
 
     first_tc, _ = _decode_frame_from_bits(data, frame_start, fps)
     if first_tc is None:
-        return None, 0
+        return None, 0, 0
 
     # Count consecutive frames at 10-byte spacings
     consecutive = 1
@@ -234,7 +254,15 @@ def _score_fps(intervals, sample_rate, fps):
             break
         consecutive += 1
 
-    return first_tc, consecutive
+    # Sample offset: sum all intervals before the first bit of this frame.
+    frame_first_bit = frame_start * 8
+    if frame_first_bit < len(bit_interval_start):
+        first_interval_idx = bit_interval_start[frame_first_bit]
+        sample_offset = sum(intervals[:first_interval_idx])
+    else:
+        sample_offset = 0
+
+    return first_tc, consecutive, sample_offset
 
 
 CANDIDATE_THRESHOLDS = [0.01, 0.02, 0.03, 0.04, 0.06, 0.08]
@@ -245,11 +273,14 @@ def decode_ltc_numpy(samples, sample_rate, fps=None):
 
     Tries several zero-crossing hysteresis thresholds and FPS values,
     picking the combination that yields the most consecutive valid frames.
+    Computes the sample-offset of the first decoded LTC frame and
+    back-calculates the actual start timecode at audio-sample zero.
+
     If fps is None, auto-detects frame rate; if given, only that rate is used.
     Returns (timecode_str, used_fps) or (None, None).
     """
     fps_list = [fps] if fps is not None else list(CANDIDATE_FPS)
-    best_tc, best_fps, best_score = None, None, 0
+    best_tc, best_fps, best_score, best_offset, best_threshold = None, None, 0, 0, 0.02
 
     for threshold in CANDIDATE_THRESHOLDS:
         crossings = find_zero_crossings(samples, threshold=threshold)
@@ -261,11 +292,25 @@ def decode_ltc_numpy(samples, sample_rate, fps=None):
             continue
 
         for try_fps in fps_list:
-            tc, score = _score_fps(intervals, sample_rate, try_fps)
+            tc, score, sample_offset = _score_fps(intervals, sample_rate, try_fps)
             if tc and score > best_score:
                 best_tc, best_fps, best_score = tc, try_fps, score
+                best_offset = sample_offset
+                best_threshold = threshold
 
-    return best_tc, best_fps
+    if best_tc is None:
+        return None, None
+
+    offset_frames = round(best_offset / sample_rate * best_fps)
+    start_tc = _subtract_frames(best_tc, best_fps, offset_frames)
+
+    log.debug(
+        f"  LTC: first={best_tc} offset={best_offset}spl "
+        f"({offset_frames}fr @{best_fps}fps, th={best_threshold:.2f}) "
+        f"→ start={start_tc}"
+    )
+
+    return start_tc, best_fps
 
 
 def decode_ltc_from_wav(wav_path, fps=None, max_seconds=10):
