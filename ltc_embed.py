@@ -568,15 +568,14 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
 
         # Determine output path
         if overwrite:
-            output_path = video_path
-            # Write to temp first, then move
-            with tempfile.NamedTemporaryFile(
-                suffix=ext, delete=False
-            ) as tmp_out:
-                temp_output = Path(tmp_out.name)
-            write_timecode_to_video(video_path, tc, temp_output)
-            temp_output.replace(video_path)
-            log.info(f"  Updated (in-place): {video_path.name}")
+            temp_output = video_path.parent / f"._ltc_tmp_{video_path.name}"
+            try:
+                write_timecode_to_video(video_path, tc, temp_output)
+                temp_output.replace(video_path)
+                log.info(f"  Updated (in-place): {video_path.name}")
+            finally:
+                if temp_output.exists():
+                    temp_output.unlink(missing_ok=True)
         else:
             stem = video_path.stem
             output_path = video_path.parent / f"{stem}{suffix}{ext}"
