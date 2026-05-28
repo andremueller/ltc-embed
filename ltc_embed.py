@@ -564,30 +564,62 @@ def find_tmcd_streams(video_path):
     return tmcd
 
 
-def write_timecode_to_video(video_path, timecode_str, output_path):
-    """Embed timecode metadata into video without re-encoding.
+def _get_audio_bitrate(video_path):
+    """Return the bitrate of the first audio stream, or None."""
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-select_streams", "a:0", str(video_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        info = json.loads(result.stdout)
+        for s in info.get("streams", []):
+            br = s.get("bit_rate")
+            if br:
+                return int(br)
+    except Exception:
+        pass
+    return None
+
+
+def write_timecode_to_video(video_path, timecode_str, output_path, strip_ltc_audio=False):
+    """Embed timecode metadata into video without re-encoding the video stream.
 
     Existing tmcd tracks are stripped first so the new timecode is the
     only one — avoids duplicate timecode entries that confuse NLEs.
-    Uses -map 0 to preserve all streams (including GoPro gpmd metadata).
+
+    When *strip_ltc_audio* is True, the stereo audio track is replaced
+    with a mono track carrying only the right channel (the LTC signal
+    on the left channel has already been extracted and is no longer
+    needed).  The audio is re-encoded as AAC at the original bitrate.
     """
+    tmcd_idxs = find_tmcd_streams(video_path)
     cmd = [
         "ffmpeg",
         "-y",
-        "-v",
-        "error",
-        "-i",
-        str(video_path),
-        "-map",
-        "0",
+        "-v", "error",
+        "-i", str(video_path),
     ]
-    for idx in find_tmcd_streams(video_path):
-        cmd += ["-map", f"-0:{idx}"]
+
+    if strip_ltc_audio:
+        orig_bitrate = _get_audio_bitrate(video_path)
+        bitrate_arg = str(orig_bitrate) if orig_bitrate else "192k"
+
+        cmd += [
+            "-map", "0:v", "-c:v", "copy",
+            "-map", "0:a:0",
+            "-af", "pan=mono|c0=c1",
+            "-c:a", "aac", "-b:a", bitrate_arg,
+        ]
+        cmd += ["-metadata:s:a:0", "handler_name=Mono Audio"]
+    else:
+        cmd += ["-map", "0"]
+        for idx in tmcd_idxs:
+            cmd += ["-map", f"-0:{idx}"]
+        cmd += ["-c", "copy"]
+
     cmd += [
-        "-c",
-        "copy",
-        "-timecode",
-        timecode_str,
+        "-timecode", timecode_str,
         str(output_path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -607,7 +639,7 @@ def write_timecode_to_video(video_path, timecode_str, output_path):
 OUTPUT_SUFFIX = "_tc"
 
 
-def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0, drift_auto=False):
+def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0, drift_auto=False, strip_ltc_audio=False):
     """Process a single video file: extract LTC audio, decode timecode, embed.
 
     Returns True on success, False if skipped, raises on error.
@@ -714,16 +746,19 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
         if overwrite:
             temp_output = video_path.parent / f"._ltc_tmp_{video_path.name}"
             try:
-                write_timecode_to_video(video_path, tc, temp_output)
+                write_timecode_to_video(video_path, tc, temp_output, strip_ltc_audio)
                 temp_output.replace(video_path)
-                log.info(f"  Updated (in-place): {video_path.name}")
+                msg = "Updated (in-place)"
+                if strip_ltc_audio:
+                    msg += " (LTC audio stripped → mono)"
+                log.info(f"  {msg}: {video_path.name}")
             finally:
                 if temp_output.exists():
                     temp_output.unlink()
         else:
             stem = video_path.stem
             output_path = video_path.parent / f"{stem}{suffix}{ext}"
-            write_timecode_to_video(video_path, tc, output_path)
+            write_timecode_to_video(video_path, tc, output_path, strip_ltc_audio)
             log.info(f"  Written: {output_path.name}")
 
         return True
@@ -734,7 +769,7 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
 
 
 def process_directory(
-    directory, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0, drift_auto=False,
+    directory, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0, drift_auto=False, strip_ltc_audio=False,
 ):
     """Scan directory for video files and process each."""
     directory = Path(directory)
@@ -757,7 +792,7 @@ def process_directory(
 
     for video in videos:
         try:
-            result = process_file(video, fps, suffix, overwrite, max_duration, frame_offset, drift_auto)
+            result = process_file(video, fps, suffix, overwrite, max_duration, frame_offset, drift_auto, strip_ltc_audio)
             if result:
                 success += 1
             else:
@@ -820,6 +855,12 @@ def main():
         help="Auto-apply drift correction from head/tail LTC measurement",
     )
     parser.add_argument(
+        "--strip-ltc-audio",
+        action="store_true",
+        dest="strip_ltc_audio",
+        help="Replace stereo audio with mono (right channel only, strips LTC audio)",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug output"
     )
     args = parser.parse_args()
@@ -842,10 +883,10 @@ def main():
     for path in args.input:
         p = Path(path)
         if p.is_dir():
-            process_directory(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset, args.drift_auto)
+            process_directory(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset, args.drift_auto, args.strip_ltc_audio)
         elif p.is_file():
             try:
-                process_file(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset, args.drift_auto)
+                process_file(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset, args.drift_auto, args.strip_ltc_audio)
             except Exception as exc:
                 log.error(f"FAILED: {p.name} — {exc}")
         else:
