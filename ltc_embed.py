@@ -564,12 +564,13 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
         return False
 
     if fps is None:
-        fps = info.get("fps")
-        if fps is None:
-            log.warning(f"No FPS info, defaulting to 25: {video_path.name}")
-            fps = 25
+        video_fps = info.get("fps")
+        if video_fps is None:
+            video_fps = 25
+    else:
+        video_fps = fps
 
-    log.info(f"Processing: {video_path.name} (fps={fps})")
+    log.info(f"Processing: {video_path.name} (fps={video_fps})")
 
     # Extract audio to temporary WAV
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -599,7 +600,7 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
             log.info(f"SKIP (no LTC signal found): {video_path.name}")
             return False
 
-        fps_str = f" @{detected_fps}fps" if detected_fps and detected_fps != fps else ""
+        fps_str = f" @{detected_fps}fps" if detected_fps and detected_fps != video_fps else ""
         log.info(f"  Timecode: {tc}{fps_str}")
 
         # Determine output path
