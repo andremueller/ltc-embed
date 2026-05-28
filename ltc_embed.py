@@ -607,7 +607,7 @@ def write_timecode_to_video(video_path, timecode_str, output_path):
 OUTPUT_SUFFIX = "_tc"
 
 
-def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0):
+def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0, drift_auto=False):
     """Process a single video file: extract LTC audio, decode timecode, embed.
 
     Returns True on success, False if skipped, raises on error.
@@ -675,7 +675,7 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
         # ── tail-drift check ──
         duration_s = info.get("duration")
         effective_fps = detected_fps if detected_fps else video_fps
-        if duration_s and duration_s > max_duration * 3 and effective_fps:
+        if duration_s and duration_s > max_duration * 6 and effective_fps:
             tail_wav = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
             try:
                 extract_audio_to_wav(video_path, tail_wav, max_duration, seek_end=True)
@@ -686,11 +686,19 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
                     drift_frames = _timecode_to_frame_number(tail_tc, effective_fps) - _timecode_to_frame_number(expected_tail_tc, effective_fps)
                     if drift_frames != 0:
                         sign = "+" if drift_frames > 0 else ""
-                        log.warning(
-                            f"  Drift: head={tc} tail={tail_tc} expected={expected_tail_tc} "
-                            f"→ {sign}{drift_frames}fr over {duration_s:.0f}s "
-                            f"({'⚠ ' if abs(drift_frames) > 1 else ''}adjust with --offset {sign}{-drift_frames})"
-                        )
+                        if drift_auto:
+                            auto_offset = round(drift_frames / 2)
+                            tc = _subtract_frames(tc, effective_fps, -auto_offset)
+                            log.info(
+                                f"  Drift: {sign}{drift_frames}fr over {duration_s:.0f}s "
+                                f"→ auto-offset {auto_offset}fr applied, TC now {tc}"
+                            )
+                        else:
+                            log.warning(
+                                f"  Drift: head={tc} tail={tail_tc} expected={expected_tail_tc} "
+                                f"→ {sign}{drift_frames}fr over {duration_s:.0f}s "
+                                f"({'⚠ ' if abs(drift_frames) > 1 else ''}adjust with --offset {sign}{-drift_frames})"
+                            )
                     else:
                         log.info(f"  Drift: head/tail consistent (0fr over {duration_s:.0f}s)")
             except Exception as exc:
@@ -726,7 +734,7 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
 
 
 def process_directory(
-    directory, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0,
+    directory, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0, drift_auto=False,
 ):
     """Scan directory for video files and process each."""
     directory = Path(directory)
@@ -749,7 +757,7 @@ def process_directory(
 
     for video in videos:
         try:
-            result = process_file(video, fps, suffix, overwrite, max_duration, frame_offset)
+            result = process_file(video, fps, suffix, overwrite, max_duration, frame_offset, drift_auto)
             if result:
                 success += 1
             else:
@@ -806,6 +814,12 @@ def main():
         help="Manual frame offset (e.g. -3 to shift timecode 3 frames earlier)",
     )
     parser.add_argument(
+        "--drift-auto",
+        action="store_true",
+        dest="drift_auto",
+        help="Auto-apply drift correction from head/tail LTC measurement",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug output"
     )
     args = parser.parse_args()
@@ -828,10 +842,10 @@ def main():
     for path in args.input:
         p = Path(path)
         if p.is_dir():
-            process_directory(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset)
+            process_directory(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset, args.drift_auto)
         elif p.is_file():
             try:
-                process_file(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset)
+                process_file(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset, args.drift_auto)
             except Exception as exc:
                 log.error(f"FAILED: {p.name} — {exc}")
         else:
