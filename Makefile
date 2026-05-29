@@ -14,8 +14,9 @@ OVERWRITE  ?=
 OFFSET     ?= 0
 DRIFT_AUTO ?=
 STRIP_LTC  ?=
+DRY_RUN    ?=
 
-ARGS = $(if $(FPS),--fps $(FPS)) --suffix $(SUFFIX) --duration $(DURATION) --offset $(OFFSET) $(if $(DRIFT_AUTO),--drift-auto) $(if $(STRIP_LTC),--strip-ltc-audio) $(if $(OVERWRITE),--overwrite) --verbose
+ARGS = $(if $(FPS),--fps $(FPS)) --suffix $(SUFFIX) --duration $(DURATION) --offset $(OFFSET) $(if $(DRIFT_AUTO),--drift-auto) $(if $(STRIP_LTC),--strip-ltc-audio) $(if $(DRY_RUN),--dry-run) $(if $(OVERWRITE),--overwrite) --verbose
 
 help: ## Show this help
 	@awk 'BEGIN {FS = "## "} /^[a-zA-Z_-]+:.*## / {split($$1, t, ":"); printf "  \033[36m%-16s\033[0m %s\n", t[1], $$2}' $(MAKEFILE_LIST)
@@ -34,7 +35,7 @@ check-deps: ## Verify required tools are available
 	@echo "ltcdecode:  $$(ltcdecode 2>&1 | head -1 || echo 'MISSING')"
 	@[ -x $(PYTHON) ] && $(PYTHON) -c "import numpy; print('numpy:    OK (' + numpy.__version__ + ')')" || echo "venv:     MISSING — run: make venv"
 
-run: venv ## Process video files (INPUT_DIR, FPS, SUFFIX, DURATION, OFFSET, DRIFT_AUTO, STRIP_LTC, OVERWRITE)
+run: venv ## Process video files (INPUT_DIR, FPS, SUFFIX, DURATION, OFFSET, DRIFT_AUTO, STRIP_LTC, DRY_RUN, OVERWRITE)
 	$(PYTHON) ltc_embed.py $(ARGS) $(INPUT_DIR)
 
 clean: ## Remove all *_tc output files from current directory

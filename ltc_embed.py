@@ -655,7 +655,7 @@ def write_timecode_to_video(video_path, timecode_str, output_path, strip_ltc_aud
 OUTPUT_SUFFIX = "_tc"
 
 
-def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0, drift_auto=False, strip_ltc_audio=False):
+def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0, drift_auto=False, strip_ltc_audio=False, dry_run=False):
     """Process a single video file: extract LTC audio, decode timecode, embed.
 
     Returns True on success, False if skipped, raises on error.
@@ -763,6 +763,12 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
         fps_str = f" @{detected_fps}fps" if detected_fps and detected_fps != video_fps else ""
         log.info(f"  Timecode: {tc}{fps_str}")
 
+        if dry_run:
+            if strip_ltc_audio:
+                log.info("  [DRY RUN] would strip LTC audio → mono")
+            log.info("  [DRY RUN] not writing to file")
+            return True
+
         # Determine output path
         if overwrite:
             temp_output = video_path.parent / f"._ltc_tmp_{video_path.name}"
@@ -790,7 +796,7 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
 
 
 def process_directory(
-    directory, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0, drift_auto=False, strip_ltc_audio=False,
+    directory, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, max_duration=10, frame_offset=0, drift_auto=False, strip_ltc_audio=False, dry_run=False,
 ):
     """Scan directory for video files and process each."""
     directory = Path(directory)
@@ -813,7 +819,7 @@ def process_directory(
 
     for video in videos:
         try:
-            result = process_file(video, fps, suffix, overwrite, max_duration, frame_offset, drift_auto, strip_ltc_audio)
+            result = process_file(video, fps, suffix, overwrite, max_duration, frame_offset, drift_auto, strip_ltc_audio, dry_run)
             if result:
                 success += 1
             else:
@@ -882,6 +888,12 @@ def main():
         help="Replace stereo audio with mono (right channel only, strips LTC audio)",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Analyze and report timecode without modifying any files",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug output"
     )
     args = parser.parse_args()
@@ -904,10 +916,10 @@ def main():
     for path in args.input:
         p = Path(path)
         if p.is_dir():
-            process_directory(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset, args.drift_auto, args.strip_ltc_audio)
+            process_directory(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset, args.drift_auto, args.strip_ltc_audio, args.dry_run)
         elif p.is_file():
             try:
-                process_file(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset, args.drift_auto, args.strip_ltc_audio)
+                process_file(p, args.fps, args.suffix, args.overwrite, args.duration, args.offset, args.drift_auto, args.strip_ltc_audio, args.dry_run)
             except Exception as exc:
                 log.error(f"FAILED: {p.name} — {exc}")
         else:
