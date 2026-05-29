@@ -153,6 +153,7 @@ CANDIDATE_FPS = [25, 30, 24, 29.97]
 LTC_SYNC_WORD = 0xBFFC
 LTC_FRAME_BITS = 80
 LTC_FRAME_BYTES = 10
+MIN_CONSECUTIVE_FRAMES = 3
 
 
 def _timecode_to_frame_number(tc_str, fps):
@@ -303,7 +304,7 @@ def decode_ltc_numpy(samples, sample_rate, fps=None):
                 best_offset = sample_offset
                 best_threshold = threshold
 
-    if best_tc is None:
+    if best_tc is None or best_score < MIN_CONSECUTIVE_FRAMES:
         return None, None
 
     offset_frames = round(best_offset / sample_rate * best_fps)
@@ -490,7 +491,16 @@ def get_video_info(video_path):
                     pass
             break
 
-    has_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
+    has_audio = False
+    audio_channels = None
+    has_video_tc = False
+    for s in info.get("streams", []):
+        if s.get("codec_type") == "audio":
+            has_audio = True
+            if "channels" in s:
+                audio_channels = s["channels"]
+        if s.get("codec_type") == "video" and "timecode" in s.get("tags", {}):
+            has_video_tc = True
 
     duration = None
     fmt = info.get("format", {})
@@ -500,7 +510,13 @@ def get_video_info(video_path):
         except (ValueError, TypeError):
             pass
 
-    return {"fps": fps, "has_audio": has_audio, "duration": duration}
+    return {
+        "fps": fps,
+        "has_audio": has_audio,
+        "audio_channels": audio_channels,
+        "has_video_tc": has_video_tc,
+        "duration": duration,
+    }
 
 
 def extract_audio_to_wav(video_path, wav_path, max_seconds=10, seek_end=False):
@@ -661,6 +677,11 @@ def process_file(video_path, fps=None, suffix=OUTPUT_SUFFIX, overwrite=False, ma
 
     if not info["has_audio"]:
         log.info(f"SKIP (no audio track): {video_path.name}")
+        return False
+
+    audio_channels = info.get("audio_channels")
+    if audio_channels == 1 and info.get("has_video_tc"):
+        log.info(f"SKIP (already processed – mono audio + TC): {video_path.name}")
         return False
 
     if fps is None:
